@@ -77,6 +77,9 @@ def verify_chain(lines):
             skipped += 1
             continue
 
+        if ph and not started:
+            print(f"FAIL: first line has prev_hash set (hash trimming detected)")
+
         if not started:
             prev = ph
             started = True
