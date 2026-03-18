@@ -120,18 +120,18 @@ RiskTOTP добавляет **второй фактор (TOTP)** не тольк
 
 Примеры:
 
-`sudo secure-admin useradd <new_user>`
-`sudo secure-admin usermod lock <user>`
-`sudo secure-admin usermod add-groups <user> operators`
+1. `sudo secure-admin useradd <new_user>`
+2. `sudo secure-admin usermod lock <user>`
+3. `sudo secure-admin usermod add-groups <user> operators`
 
 ## Просмотр аудита
 
 Примеры:
 
-`sudo secure-audit-view --tail 50`
-`sudo secure-audit-view --approvals`
-`sudo secure-audit-view --id 4`
-`sudo secure-audit-view --verify`
+1. `sudo secure-audit-view --tail 50`
+2. `sudo secure-audit-view --approvals`
+3. `sudo secure-audit-view --id 4`
+4. `sudo secure-audit-view --verify`
 
 ---
 
