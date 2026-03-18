@@ -1,0 +1,305 @@
+#!/usr/bin/python3
+import hashlib
+import sys, getpass, subprocess, time, sqlite3, os, pwd
+from pathlib import Path
+import pyotp
+import json
+from datetime import datetime, timezone
+
+AUDIT_LOG = Path("/var/log/risktotp/audit.log")
+DB_PATH = Path("/var/lib/risktotp/secure_totp.db")
+MAX_FAILS = 3
+BLOCK_SECONDS = 300
+
+# common prefixes for sshkeys
+ALLOWED_PREFIXES = (
+    'ssh-ed25519',
+    'ssh-rsa',
+    'ecdsa-sha2-',
+    'sk-ssh-ed25519@',
+    'sk-ecdsa-sha2-'
+)
+
+def get_last_hash():
+    if not AUDIT_LOG.exists(): # which is strange
+        return "0" * 64
+    try:
+        # read last line
+        with AUDIT_LOG.open("rb") as f:
+            f.seek(0, 2) # from the end
+            size = f.tell()
+            if size == 0:
+                return "0" * 64
+            # read back
+            back = min(8192, size)
+            f.seek(-back, 2)
+            tail = f.read().splitlines()
+            for line in reversed(tail):
+                if line.strip():
+                    obj = json.loads(line.decode("utf-8", "ignore"))
+                    return obj.get("hash", "0"*64) # return last line hash
+    except Exception:
+        return "0" * 64 # any other way
+    return "0" * 64
+
+def audit(event, operator, action, target="", argv=None, result="", extra=None):
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "operator": operator,
+        "uid": os.getuid(),
+        "action": action,
+        "target": target,
+        "argv": argv or [],
+        "result": result,
+        "extra": extra or {},
+    }
+    prev = get_last_hash()
+    rec["prev_hash"] = prev
+    payload = json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) # dump last entry
+    rec["hash"] = hashlib.sha256((prev + payload).encode("utf-8")).hexdigest() # get hash
+    line = json.dumps(rec, ensure_ascii=False)
+    with AUDIT_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n") # hopefully write
+
+def read_pubkey_file(path_str, user, action):
+    p = Path(path_str)
+
+    if os.path.islink(p):
+        print("Файл ключа не должен быть symlink.")
+        audit("read_key", user, action, target=sys.argv[1], argv=sys.argv[1:], result="FAIL_SYMLINK")
+        sys.exit(1)
+    if not p.exists():
+        print("Файл ключа не найден.")
+        audit("read_key", user, action, target=sys.argv[1], argv=sys.argv[1:], result="NO_FILE")
+        sys.exit(1)
+
+    data = p.read_text(encoding="utf-8", errors="strict").strip()
+    if "\n" in data or "\r" in data:
+        print("Public key должен быть одной строкой.")
+        audit("read_key", user, action, target=sys.argv[1], argv=sys.argv[1:], result="FAIL_READ")
+        sys.exit(1)
+    audit("read_key", user, action, target=sys.argv[1], argv=sys.argv[1:], result="READ_SUCCESS")
+    return data
+
+def check_ssh_dir(user):
+    #we only need pwd for the user
+    pw = pwd.getpwnam(user)
+    home = Path(pw.pw_dir)
+    uid, gid = pw.pw_uid, pw.pw_gid
+
+    ssh_dir = home / ".ssh"
+    auth_keys = ssh_dir / "authorized_keys"
+
+    # symlink check
+    if ssh_dir.exists() and ssh_dir.is_symlink():
+        print("~/.ssh является symlink — отказ.")
+        audit("check_ssh", user, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FAIL_SYMLINK")
+        sys.exit(1)
+    if auth_keys.exists() and auth_keys.is_symlink():
+        print("authorized_keys является symlink — отказ.")
+        audit("check_ssh", user, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FAIL_SYMLINK")
+        sys.exit(1)
+
+    # create ~/.ssh
+    if not ssh_dir.exists():
+        ssh_dir.mkdir(mode=0o700, parents=True)
+        os.chown(ssh_dir, 0, 0)
+    else:
+        os.chmod(ssh_dir, 0o700)
+        os.chown(ssh_dir, 0, 0)
+
+    # create auth_keys dir
+    if not auth_keys.exists():
+        auth_keys.touch(mode=0o600)
+        os.chown(auth_keys, 0, 0)
+    else:
+        os.chmod(auth_keys, 0o600)
+        os.chown(auth_keys, 0, 0)
+
+    #pass uid and gid for file chown
+    return ssh_dir, auth_keys, uid, gid
+
+def remove_pubkey(operator, user, key_line):
+    key_line = key_line.strip()
+
+    # format check
+    if not any(key_line.startswith(p) for p in ALLOWED_PREFIXES):
+        print("Ключ не похож на SSH public key (неверный префикс).")
+        audit("remove_key", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FAIL_PREFIX")
+        sys.exit(1)
+    if "\n" in key_line or "\r" in key_line:
+        print("Ключ должен быть одной строкой.")
+        audit("remove_key", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FAIL_READ")
+        sys.exit(1)
+
+    audit("check_ssh", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="CHECK_START")
+    _, auth_keys, uid, gid = check_ssh_dir(user)
+    audit("check_ssh", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="CHECK_DONE")
+
+    # read keys and check for existing
+    existing = auth_keys.read_text(errors="ignore").splitlines()
+
+    if key_line not in existing:
+        print("Ключ не найден в authorized_keys.")
+        audit("check_existing", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="KEY_MISSING")
+        sys.exit(1)
+
+    #can't think of a better way to do this
+    new_lines = [line for line in existing if line != key_line]
+    auth_keys.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
+    audit("remove_key", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="REMOVE_DONE")
+
+    os.chmod(auth_keys, 0o600)
+    os.chown(auth_keys, uid, gid)
+
+    removed = len(existing) - len(new_lines)
+
+    print(f"Ключ удалён (совпадений: {removed})")
+    return
+
+def add_pubkey(operator, user, key_line):
+    key_line = key_line.strip()
+
+    # format check
+    if not any(key_line.startswith(p) for p in ALLOWED_PREFIXES):
+        print("Ключ не похож на SSH public key (неверный префикс).")
+        audit("add_key", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FAIL_PREFIX")
+        sys.exit(1)
+    if "\n" in key_line or "\r" in key_line:
+        print("Ключ должен быть одной строкой.")
+        audit("add_key", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FAIL_READ")
+        sys.exit(1)
+
+    audit("check_ssh", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="CHECK_START")
+    _, auth_keys, uid, gid = check_ssh_dir(user)
+    audit("check_ssh", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="CHECK_DONE")
+    # read keys and check for existing
+    existing = auth_keys.read_text(errors="ignore").splitlines()
+    if key_line in existing:
+        audit("check_existing", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FOUND_KEY")
+        return
+
+    #append to the end
+    with auth_keys.open("a", encoding="utf-8") as f:
+        f.write(key_line + "\n")
+    audit("add_key", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="ADD_DONE")
+    #set rights
+    os.chmod(auth_keys, 0o600)
+    os.chown(auth_keys, uid, gid)
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS attempts (
+            user TEXT NOT NULL,
+            action TEXT NOT NULL,
+            fail_count INTEGER NOT NULL,
+            last_fail_ts INTEGER NOT NULL,
+            PRIMARY KEY(user, action)
+        )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      requester TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT NOT NULL,
+      argv_json TEXT NOT NULL,
+      risk TEXT NOT NULL,
+      status TEXT NOT NULL,
+      approver TEXT,
+      approved_ts INTEGER,
+      exec_ts INTEGER,
+      exec_result TEXT
+    )""")
+    conn.commit()
+    return conn
+
+def get_attempt(conn, user, action):
+    c = conn.cursor()
+    c.execute("SELECT fail_count, last_fail_ts FROM attempts WHERE user=? AND action=?",
+              (user, action))
+    row = c.fetchone()
+    return (row[0], row[1]) if row else (0, 0)
+
+def set_attempt(conn, user, action, fail, ts):
+    c = conn.cursor()
+    c.execute("""
+      INSERT INTO attempts(user, action, fail_count, last_fail_ts)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user, action) DO UPDATE SET
+        fail_count=excluded.fail_count,
+        last_fail_ts=excluded.last_fail_ts
+    """, (user, action, fail, ts))
+    conn.commit()
+
+def check_bruteforce(conn, user, action):
+    fail, last = get_attempt(conn, user, action)
+    now = int(time.time())
+    if fail >= MAX_FAILS and now - last < BLOCK_SECONDS:
+        wait = BLOCK_SECONDS - (now - last)
+        print(f"Слишком много неверных кодов. Попробуйте через {wait} секунд.")
+        audit("blocked", user, action, target=sys.argv[1], argv=sys.argv[1:], result="BLOCKED")
+        sys.exit(1)
+
+def verify_totp_for_operator(operator):
+    ga_file = Path(f"/home/{operator}/.google_authenticator")
+    if not ga_file.exists():
+        print("Нет файла .google_authenticator у оператора.")
+        audit("verify_totp", operator, "secure-sshkeys", target=sys.argv[1], argv=sys.argv[1:], result="FAIL_READ")
+        sys.exit(1)
+    secret = ga_file.read_text().splitlines()[0].strip()
+    totp = pyotp.TOTP(secret)
+    code = getpass.getpass("Введите TOTP-код оператора: ").strip()
+    return totp.verify(code, valid_window=1)
+
+def main():
+    if len(sys.argv) != 4:
+        print(f"Использование: {Path(sys.argv[0]).name} <user> <add/remove/add-file/remove-file> <public_key>")
+        sys.exit(1)
+
+    try:
+        target = sys.argv[1]
+        choice = sys.argv[2]
+        key = sys.argv[3]
+        operator = os.environ.get("SUDO_USER")
+        action = "secure-sshkeys"
+        if not operator:
+            print("Необходим запуск через sudo")
+            sys.exit(1)
+        audit("start", operator, action, target=target, argv=sys.argv[1:], result="BEGIN")
+        conn = init_db()
+        check_bruteforce(conn, operator, action)
+
+        if not verify_totp_for_operator(operator):
+            print("Неверный TOTP-код.")
+            audit("totp", operator, action, target=target, argv=sys.argv[1:], result="DENY_TOTP")
+            fail, _ = get_attempt(conn, operator, action)
+            set_attempt(conn, operator, action, fail + 1, int(time.time()))
+            time.sleep(2)
+            sys.exit(1)
+
+        set_attempt(conn, operator, action, 0, int(time.time()))
+        if choice in ['remove-file', 'add-file']:
+            audit("read_key", operator, action, target=target, argv=sys.argv[1:], result="READ_FILE")
+            key = read_pubkey_file(key, operator, action)
+        if choice in ['add', 'add-file']:
+            audit("add_key", operator, action, target=target, argv=sys.argv[1:], result="ADD_START")
+            add_pubkey(operator, target, key)
+        elif choice in ['remove', 'remove-file']:
+            audit("remove_key", operator, action, target=target, argv=sys.argv[1:], result="REMOVE_START")
+            remove_pubkey(operator, target, key)
+        else:
+            print("Неверный выбор. Доступны add/remove")
+            audit("wrong_choice", operator, action, target=target, argv=sys.argv[1:], result="WRONG_CHOICE")
+            sys.exit(1)
+    except KeyboardInterrupt:
+        print('\n')
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,67 @@
+#include <tunables/global>
+
+/usr/local/sbin/secure-approve flags=(enforce) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+
+  capability audit_write,
+  capability chown,
+  capability dac_override,
+  capability dac_read_search,
+  capability fowner,
+  capability fsetid,
+
+  /dev/pts/* rw,
+  /dev/tty rw,
+
+  /home/*/.google_authenticator r,
+
+  /usr/bin/python3 ix,
+  /usr/bin/python3.13 ix,
+
+  /usr/local/sbin/secure-approve r,
+  /usr/local/sbin/secure-admin rix,
+  /usr/local/sbin/secure-passwd rix,
+  /usr/local/sbin/secure-sshkeys rix,
+
+  /etc/.pwd.lock rwlk,
+  /etc/default/useradd r,
+  /etc/group rw,
+  /etc/group+ rw,
+  /etc/group- rw,
+  /etc/group.* rwk,
+  /etc/group.lock rwlk,
+  /etc/gshadow rw,
+  /etc/gshadow+ rw,
+  /etc/gshadow- rw,
+  /etc/gshadow.* rwk,
+  /etc/gshadow.lock rwlk,
+  /etc/login.defs r,
+  /etc/passwd rw,
+  /etc/passwd+ rw,
+  /etc/passwd- rw,
+  /etc/passwd.* rwk,
+  /etc/passwd.lock rwlk,
+  /etc/shadow rw,
+  /etc/shadow+ rw,
+  /etc/shadow- rw,
+  /etc/shadow.* rwk,
+  /etc/shadow.lock rwlk,
+  /etc/skel/ r,
+  /etc/skel/** r,
+  /etc/subgid rw,
+  /etc/subgid+ rw,
+  /etc/subgid- rw,
+  /etc/subgid.* rwk,
+  /etc/subgid.lock rwlk,
+  /etc/subuid rw,
+  /etc/subuid+ rw,
+  /etc/subuid- rw,
+  /etc/subuid.* rwk,
+  /etc/subuid.lock rwlk,
+
+  /usr/sbin/useradd mrix,
+  /usr/sbin/usermod mrix,
+  /var/lib/risktotp/** rwk,
+  /var/log/risktotp/** rwk,
+}

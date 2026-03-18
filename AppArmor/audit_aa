@@ -1,0 +1,17 @@
+#include <tunables/global>
+
+/usr/local/sbin/secure-audit-view flags=(enforce) {
+  #include <abstractions/base>
+
+  /usr/local/sbin/secure-audit-view r,
+  /usr/bin/python3 ix,
+  /usr/bin/python3.13 ix,
+
+  /var/log/risktotp/ r,
+  /var/log/risktotp/audit.log r,
+  /var/log/risktotp/audit.log.* r,
+  /var/log/risktotp/audit.log.*.gz r,
+
+  /dev/tty rw,
+  /dev/pts/* rw,
+}

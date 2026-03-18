@@ -1,0 +1,39 @@
+# Last Modified: Sun Dec 28 10:42:39 2025
+include <tunables/global>
+
+/usr/local/sbin/secure-passwd flags=(enforce){
+  include <abstractions/base>
+
+  capability chown,
+  capability dac_override,
+  capability dac_read_search,
+  capability fsetid,
+  capability setuid,
+
+  network netlink raw,
+
+  deny owner /proc/*/loginuid r,
+
+  /dev/pts/* rw,
+  /dev/tty rw,
+  /etc/.pwd.lock wk,
+  /etc/nshadow rw,
+  /etc/nsswitch.conf r,
+  /etc/pam.d/* r,
+  /etc/passwd r,
+  /etc/shadow rw,
+  /etc/ssl/kali.cnf r,
+  /home/*/.google_authenticator r,
+  /usr/bin/passwd mrix,
+  /usr/bin/python3 ix,
+  /usr/bin/python3.13 ix,
+  /usr/local/sbin/secure-passwd r,
+  /usr/sbin/unix_chkpwd mrix,
+  /var/lib/risktotp/** rwk,
+  /var/log/risktotp/** rwk,
+  owner /etc/login.defs r,
+  owner /usr/local/lib/python3.13/dist-packages/ r,
+  owner /usr/local/sbin/ r,
+  owner /var/lib/risktotp/ r,
+
+}

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+import json, sys, hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+PATH = Path("/var/log/risktotp/audit.log")
+
+def usage():
+    print("Использование: secure-audit-view [--tail N] [--id ID] [--approvals] [--verify]")
+    print("  --tail N       Показать последние N записей (по умолчанию: все)")
+    print("  --id ID        Показать события по approval_id=ID (extra.approval_id)")
+    print("  --approvals    Показать только события REQUEST/APPROVE/EXEC*")
+    print("  --verify       Проверить хэш-цепочку логов")
+    sys.exit(1)
+
+def parse_args(argv):
+    tail = None
+    only_id = None
+    approvals = False
+    verify = False
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--tail":
+            i += 1
+            if i >= len(argv): usage()
+            tail = int(argv[i])
+        elif a == "--id":
+            i += 1
+            if i >= len(argv): usage()
+            only_id = int(argv[i])
+        elif a == "--approvals":
+            approvals = True
+        elif a == "--verify":
+            verify = True
+        else:
+            usage()
+        i += 1
+    return tail, only_id, approvals, verify
+
+def fmt_ts(ts):
+    try:
+        #readability
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%SZ")
+    except Exception:
+        return ts
+
+def is_approval_event(rec):
+    ev = rec.get("event", "")
+    res = rec.get("result", "")
+    #
+    return (ev in {"request", "approved", "approve_start", "execute_approved"} or
+            "APPROV" in res or "PENDING" in res or "APPROVED" in res or "EXEC_" in res)
+
+def verify_chain(lines):
+    prev = None
+    started = False
+    checked = 0
+    skipped = 0
+
+    for idx, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            skipped += 1
+            continue
+
+        h = obj.get("hash")
+        ph = obj.get("prev_hash")
+        if not h or not ph:
+            skipped += 1
+            continue
+
+        if not started:
+            prev = ph
+            started = True
+
+        if ph != prev:
+            print(f"FAIL: prev_hash mismatch at line {idx}")
+            return 2
+
+        payload_obj = dict(obj)
+        payload_obj.pop("hash", None)
+        payload = json.dumps(payload_obj, ensure_ascii=False,
+                             sort_keys=True, separators=(",", ":"))
+        calc = hashlib.sha256((prev + payload).encode("utf-8")).hexdigest()
+
+        if h != calc:
+            print(f"FAIL: hash mismatch at line {idx}")
+            return 3
+
+        prev = h
+        checked += 1
+
+    if not started:
+        print("Нет хэшированных записей для проверки.")
+        return 0
+
+    print(f"OK: checked={checked}, skipped={skipped}")
+    return 0
+
+
+def main():
+    tail, only_id, approvals, do_verify = parse_args(sys.argv[1:])
+
+    if not PATH.exists():
+        print("audit.log не найден.")
+        sys.exit(1)
+
+    lines = PATH.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+    if tail is not None and tail > 0:
+        lines = lines[-tail:]
+
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+
+        if approvals and not is_approval_event(r):
+            continue
+
+        if only_id is not None:
+            aid = (r.get("extra", {}) or {}).get("approval_id")
+            if aid != only_id and r.get("target") != str(only_id):
+                continue
+
+        ts = fmt_ts(r.get("ts", ""))
+        op = r.get("operator", "")
+        act = r.get("action", "")
+        tgt = r.get("target", "")
+        res = r.get("result", "")
+        ev = r.get("event", "")
+
+        extra = r.get("extra", {}) or {}
+        aid = extra.get("approval_id")
+        risk = extra.get("risk")
+        suffix = []
+        if aid is not None:
+            suffix.append(f"id={aid}")
+        if risk:
+            suffix.append(f"risk={risk}")
+        if suffix:
+            suffix = " | " + " ".join(suffix)
+        else:
+            suffix = ""
+
+        print(f"{ts} | {op:12} | {ev:14} | {act:20} | {tgt:16} | {res}{suffix}")
+
+    if do_verify:
+        rc = verify_chain(lines)
+        if rc != 0:
+            sys.exit(rc)
+
+if __name__ == "__main__":
+    main()

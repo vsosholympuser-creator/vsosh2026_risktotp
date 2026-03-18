@@ -1,0 +1,27 @@
+# Last Modified: Sun Dec 28 10:58:06 2025
+include <tunables/global>
+
+/usr/local/sbin/secure-sshkeys flags=(enforce) {
+  include <abstractions/base>
+  include <abstractions/nameservice>
+  capability dac_override,
+  capability dac_read_search,
+  capability fowner,
+  capability chown,
+  /dev/pts/* rw,
+  /dev/tty rw,
+  /home/*/.google_authenticator r,
+  /home/*/.ssh/ rw,
+  /home/*/.ssh/** rwk,
+  /home/*/*.pub r,
+  /home/*/demo/*.pub r,
+  /usr/bin/python3 ix,
+  /usr/bin/python3.13 ix,
+  /usr/local/sbin/secure-sshkeys r,
+  /var/lib/risktotp/** rwk,
+  /var/log/risktotp/** rwk,
+  owner /usr/local/lib/python3.13/dist-packages/ r,
+  owner /usr/local/sbin/ r,
+  owner /var/lib/risktotp/ r,
+
+}

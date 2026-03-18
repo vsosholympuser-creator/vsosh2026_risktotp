@@ -1,0 +1,347 @@
+#!/usr/bin/python3
+import hashlib
+import sys, getpass, subprocess, time, sqlite3, os
+from pathlib import Path
+import pyotp
+import argparse, pwd, re
+import json
+from datetime import datetime, timezone
+
+
+DB_PATH = Path("/var/lib/risktotp/secure_totp.db")
+AUDIT_LOG = Path("/var/log/risktotp/audit.log")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+ALLOWED_GROUPS = {"developers", "operators", "test_group"} #redact this for your use
+DEFAULT_SHELL = "/bin/bash"
+MAX_FAILS = 3
+BLOCK_SECONDS = 300
+
+def classify_risk(ns):
+    if ns.cmd == "usermod":
+        if ns.op in ["unlock", "add-groups"]:
+            if ns.op == "add-groups" and "operators" in ns.groups.split(','):
+                return "CRITICAL"
+            if ns.op == "unlock":
+                return "CRITICAL"
+        return "HIGH"
+    return "LOW"
+
+def create_approval(conn, requester, action, target, argv_list, risk):
+    now = int(time.time())
+    c = conn.cursor()
+    c.execute("""INSERT INTO approvals(ts, requester, action, target, argv_json, risk, status)
+                 VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+              (now, requester, action, target, json.dumps(argv_list, ensure_ascii=False), risk))
+    conn.commit()
+    return c.lastrowid
+
+def get_approval(conn, app_id):
+    c = conn.cursor()
+    c.execute("""SELECT id, requester, action, target, argv_json, risk, status, approver
+                 FROM approvals WHERE id=?""", (app_id,))
+    return c.fetchone()
+
+def require_approved(conn, app_id):
+    row = get_approval(conn, app_id)
+    if not row:
+        print("Заявка не найдена.")
+        sys.exit(2)
+    (_id, requester, action, target, argv_json, risk, status, approver) = row
+    if status != "APPROVED" or not approver:
+        print("Заявка не подтверждена вторым оператором.")
+        sys.exit(3)
+    return requester, action, target, json.loads(argv_json), risk, approver
+
+def get_last_hash():
+    if not AUDIT_LOG.exists(): # which is strange
+        return "0" * 64
+    try:
+        # read last line
+        with AUDIT_LOG.open("rb") as f:
+            f.seek(0, 2) # from the end
+            size = f.tell()
+            if size == 0:
+                return "0" * 64
+            # read back
+            back = min(8192, size)
+            f.seek(-back, 2)
+            tail = f.read().splitlines()
+            for line in reversed(tail):
+                if line.strip():
+                    obj = json.loads(line.decode("utf-8", "ignore"))
+                    return obj.get("hash", "0"*64) # return last line hash
+    except Exception:
+        return "0" * 64 # any other way
+    return "0" * 64
+
+def audit(event, operator, action, target="", argv=None, result="", extra=None):
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "operator": operator,
+        "uid": os.getuid(),
+        "action": action,
+        "target": target,
+        "argv": argv or [],
+        "result": result,
+        "extra": extra or {},
+    }
+    prev = get_last_hash()
+    rec["prev_hash"] = prev
+    payload = json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) # dump last entry
+    rec["hash"] = hashlib.sha256((prev + payload).encode("utf-8")).hexdigest() # get hash
+    line = json.dumps(rec, ensure_ascii=False)
+    with AUDIT_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n") # hopefully write
+
+def require_sudo_user():
+    op = os.environ.get("SUDO_USER")
+    if not op:
+        print("Запускайте через sudo (нужна переменная SUDO_USER).")
+        sys.exit(1)
+    return op
+
+def validate_user_exists(username):
+    if not USER_RE.match(username):
+        print("Некорректное имя пользователя.")
+        sys.exit(2)
+    try:
+        pwd.getpwnam(username)
+    except KeyError:
+        print(f"Пользователь '{username}' не найден.")
+        sys.exit(2)
+
+def validate_new_username(username):
+    if not USER_RE.match(username):
+        print("Некорректное имя пользователя.")
+        sys.exit(2)
+
+def validate_groups(groups_csv):
+    groups = [g.strip() for g in groups_csv.split(",") if g.strip()]
+    if not groups:
+        print("Группы не указаны.")
+        sys.exit(2)
+    bad = [g for g in groups if g not in ALLOWED_GROUPS]
+    if bad:
+        print("Запрещённые группы:", ", ".join(bad))
+        sys.exit(2)
+    return ",".join(groups)
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # assuming that attempts already exists.
+    c.execute("""CREATE TABLE IF NOT EXISTS attempts (
+      user TEXT NOT NULL,
+      action TEXT NOT NULL,
+      fail_count INTEGER NOT NULL,
+      last_fail_ts INTEGER NOT NULL,
+      PRIMARY KEY(user, action)  
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      requester TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT NOT NULL,
+      argv_json TEXT NOT NULL,
+      risk TEXT NOT NULL,
+      status TEXT NOT NULL,
+      approver TEXT,
+      approved_ts INTEGER,
+      exec_ts INTEGER,
+      exec_result TEXT
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)")
+    conn.commit()
+    return conn
+
+def get_attempt(conn, user, action):
+    c = conn.cursor()
+    c.execute("SELECT fail_count, last_fail_ts FROM attempts WHERE user=? AND action=?",
+              (user, action))
+    row = c.fetchone()
+    return (row[0], row[1]) if row else (0, 0)
+
+def set_attempt(conn, user, action, fail, ts):
+    c = conn.cursor()
+    c.execute("""
+      INSERT INTO attempts(user, action, fail_count, last_fail_ts)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user, action) DO UPDATE SET
+        fail_count=excluded.fail_count,
+        last_fail_ts=excluded.last_fail_ts
+    """, (user, action, fail, ts))
+    conn.commit()
+
+def check_bruteforce(conn, user, action, ns):
+    fail, last = get_attempt(conn, user, action)
+    now = int(time.time())
+    if fail >= MAX_FAILS and now - last < BLOCK_SECONDS:
+        wait = BLOCK_SECONDS - (now - last)
+        print(f"Слишком много неверных кодов. Попробуйте через {wait} секунд.")
+        audit("blocked", user, action, target=ns.user if hasattr(ns, "user") else "", argv=sys.argv[1:], result="BLOCKED")
+        sys.exit(1)
+
+def verify_totp_for_operator(operator):
+    ga_file = Path(f"/home/{operator}/.google_authenticator")
+    if not ga_file.exists():
+        print("Нет файла .google_authenticator у оператора.")
+        sys.exit(1)
+    secret = ga_file.read_text().splitlines()[0].strip()
+    totp = pyotp.TOTP(secret)
+    code = getpass.getpass("Введите TOTP-код оператора: ").strip()
+    return totp.verify(code, valid_window=1)
+
+def build_parser():
+    p = argparse.ArgumentParser(prog=Path(sys.argv[0]).name)
+
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    # ===== useradd =====
+    pa = sp.add_parser("useradd", help="Создать пользователя (ограниченный набор опций)")
+    pa.add_argument("user", help="новый пользователь")
+    pa.add_argument("--shell", default=DEFAULT_SHELL, help="разрешённый shell (по умолчанию /bin/bash)")
+    pa.add_argument("--create-home", action="store_true", default=True, help="создать home (по умолчанию да)")
+
+    # ===== usermod =====
+    pm = sp.add_parser("usermod", help="Изменить пользователя (allow-list)")
+    sm = pm.add_subparsers(dest="op", required=True)
+
+    pl = sm.add_parser("lock", help="Заблокировать пользователя")
+    pl.add_argument("user")
+
+    pu = sm.add_parser("unlock", help="Разблокировать пользователя")
+    pu.add_argument("user")
+
+    pg = sm.add_parser("add-groups", help="Добавить в разрешённые группы (только -aG)")
+    pg.add_argument("user")
+    pg.add_argument("groups", help="через запятую, напр. developers,operators")
+
+    return p
+
+def main():
+    operator = require_sudo_user()
+    conn = init_db()
+
+    # no argparse
+    if len(sys.argv) == 3 and sys.argv[1] == "--execute-approved":
+        app_id = int(sys.argv[2])
+        requester, action_name, target, argv_list, risk, approver = require_approved(conn, app_id)
+
+        audit("exec", operator, "secure-admin", target=target,
+              argv=[str(app_id)], result="RUN_APPROVED",
+              extra={"approver": approver, "requester": requester, "saved_argv": argv_list, "approval_id":app_id})
+
+        if len(argv_list) >= 3 and argv_list[0] == "usermod":
+            op = argv_list[1]
+            user = argv_list[2]
+            #only this for now
+            if op == "unlock":
+                subprocess.run(["/usr/sbin/usermod", "-U", user], check=True)
+                audit("exec", operator, "secure-admin", target=user, argv=argv_list, result="DONE_APPROVED_UNLOCK", extra={"approval_id":app_id})
+                sys.exit(0)
+
+            if op == "add-groups":
+                if len(argv_list) != 4:
+                    print("Некорректная заявка (ожидалось: usermod add-groups <user> <groups>).")
+                    sys.exit(4)
+                groups = argv_list[3]
+                subprocess.run(["/usr/sbin/usermod", "-aG", groups, user], check=True)
+                audit("exec", operator, "secure-admin", target=user, argv=argv_list, result="DONE_APPROVED_GROUPS", extra={"approval_id":app_id})
+                sys.exit(0)
+
+        print("Заявка содержит неподдерживаемую команду.")
+        sys.exit(5)
+
+    parser = build_parser()
+    ns = parser.parse_args()
+
+    # different action
+    action = f"secure-{ns.cmd}" if ns.cmd != "usermod" else f"secure-usermod:{ns.op}"
+    audit("start", operator, action, target=ns.user if hasattr(ns, "user") else "", argv=sys.argv[1:], result="BEGIN")
+
+    try:
+        check_bruteforce(conn, operator, action, ns)
+
+        if not verify_totp_for_operator(operator):
+            print("Неверный TOTP-код.")
+            audit("totp", operator, action, target=ns.user if hasattr(ns, "user") else "", argv=sys.argv[1:], result="DENY_TOTP")
+            fail, _ = get_attempt(conn, operator, action)
+            set_attempt(conn, operator, action, fail + 1, int(time.time()))
+            time.sleep(2)
+            sys.exit(1)
+
+        set_attempt(conn, operator, action, 0, int(time.time()))
+        audit("totp", operator, action, target=ns.user, argv=sys.argv[1:], result="OK")
+        if ns.cmd == "useradd":
+            validate_new_username(ns.user)
+            if ns.shell != DEFAULT_SHELL:
+                print("Запрещённый shell.")
+                audit("blocked", operator, action, target=ns.user, argv=sys.argv[1:], result="ADD_SHELL")
+                sys.exit(2)
+            cmd = ["/usr/sbin/useradd"]
+            if ns.create_home:
+                cmd += ["-m"]
+            cmd += ["-s", DEFAULT_SHELL, ns.user]
+            audit("exec", operator, action, target=ns.user, argv=sys.argv[1:], result="RUN_ADD")
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as e:
+                audit("exec", operator, action, target=ns.user, argv=sys.argv[1:], result=f"FAIL(rc={e.returncode})")
+                print("Операция не выполнена. Произошла ошибка (подробности в логах).")
+                sys.exit(1)
+            sys.exit(0)
+
+        if ns.cmd == "usermod":
+            validate_user_exists(ns.user)
+
+            if ns.op == "lock":
+                audit("exec", operator, action, target=ns.user, argv=sys.argv[1:], result="RUN_MOD_LOCK")
+                try:
+                    subprocess.run(["/usr/sbin/usermod", "-L", ns.user], check=True)
+                except subprocess.CalledProcessError as e:
+                    audit("exec", operator, action, target=ns.user, argv=sys.argv[1:],
+                          result=f"FAIL(rc={e.returncode})")
+                    print("Операция не выполнена. Произошла ошибка (подробности в логах).")
+                    sys.exit(1)
+                audit("exec", operator, action, target=ns.user, argv=sys.argv[1:], result="DONE_MOD_LOCK")
+                sys.exit(0)
+            if ns.op == "unlock":
+                risk = "CRITICAL"
+                app_id = create_approval(conn, operator, "secure-admin", ns.user, sys.argv[1:], risk)
+                audit("request", operator, action, target=ns.user, argv=sys.argv[1:], result="PENDING",
+                      extra={"approval_id":app_id, "risk":risk})
+                print(f"CRITICAL: создана заявка #{app_id}. Для выполнения нужен второй оператор: ")
+                print(f"  sudo secure-approve {app_id}")
+                sys.exit(0)
+            if ns.op == "add-groups":
+                groups = validate_groups(ns.groups)
+                if "operators" in groups.split(','):
+                    risk = "CRITICAL"
+                    app_id = create_approval(conn, operator, "secure-admin", ns.user, sys.argv[1:], risk)
+                    audit("request", operator, action, target=ns.user, argv=sys.argv[1:], result="PENDING",
+                          extra={"approval_id":app_id, "risk":risk, "groups":groups})
+                    print(f"CRITICAL: создана заявка #{app_id}. Для выполнения нужен второй оператор: ")
+                    print(f"  sudo secure-approve {app_id}")
+                    sys.exit(0)
+                #else just do what was earlier
+                audit("exec", operator, action, target=ns.user, argv=sys.argv[1:], result="RUN_MOD_GROUPS")
+                try:
+                    subprocess.run(["/usr/sbin/usermod", "-aG", groups, ns.user], check=True)
+                except subprocess.CalledProcessError as e:
+                    audit("exec", operator, action, target=ns.user, argv=sys.argv[1:],
+                          result=f"FAIL(rc={e.returncode})")
+                    print("Операция не выполнена. Произошла ошибка (подробности в логах).")
+                    sys.exit(1)
+                audit("exec", operator, action, target=ns.user, argv=sys.argv[1:], result="DONE_MOD_GROUPS")
+                sys.exit(0)
+
+    except KeyboardInterrupt:
+        print('\n')
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()

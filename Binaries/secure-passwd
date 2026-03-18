@@ -1,0 +1,164 @@
+#!/usr/bin/python3
+import hashlib
+import sys, getpass, subprocess, time, sqlite3, os
+from pathlib import Path
+import pyotp
+import json
+from datetime import datetime, timezone
+
+
+AUDIT_LOG = Path("/var/log/risktotp/audit.log")
+DB_PATH = Path("/var/lib/risktotp/secure_totp.db")
+MAX_FAILS = 3
+BLOCK_SECONDS = 300
+
+def get_last_hash():
+    if not AUDIT_LOG.exists():
+        return "0" * 64
+    try:
+        # read last line
+        with AUDIT_LOG.open("rb") as f:
+            f.seek(0, 2) # from the end
+            size = f.tell()
+            if size == 0:
+                return "0" * 64
+            # read back
+            back = min(8192, size)
+            f.seek(-back, 2)
+            tail = f.read().splitlines()
+            for line in reversed(tail):
+                if line.strip():
+                    obj = json.loads(line.decode("utf-8", "ignore"))
+                    return obj.get("hash", "0"*64) # return last line hash
+    except Exception:
+        return "0" * 64 # any other way
+    return "0" * 64
+
+def audit(event, operator, action, target="", argv=None, result="", extra=None):
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "operator": operator,
+        "uid": os.getuid(),
+        "action": action,
+        "target": target,
+        "argv": argv or [],
+        "result": result,
+        "extra": extra or {},
+    }
+    prev = get_last_hash()
+    rec["prev_hash"] = prev
+    payload = json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) # dump last entry
+    rec["hash"] = hashlib.sha256((prev + payload).encode("utf-8")).hexdigest() # get hash
+    line = json.dumps(rec, ensure_ascii=False)
+    with AUDIT_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n") # hopefully write
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS attempts (
+            user TEXT NOT NULL,
+            action TEXT NOT NULL,
+            fail_count INTEGER NOT NULL,
+            last_fail_ts INTEGER NOT NULL,
+            PRIMARY KEY(user, action)
+        )
+    """)
+    c.execute("""CREATE TABLE IF NOT EXISTS approvals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL,
+      requester TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT NOT NULL,
+      argv_json TEXT NOT NULL,
+      risk TEXT NOT NULL,
+      status TEXT NOT NULL,
+      approver TEXT,
+      approved_ts INTEGER,
+      exec_ts INTEGER,
+      exec_result TEXT
+    )""")
+    conn.commit()
+    return conn
+
+def get_attempt(conn, user, action):
+    c = conn.cursor()
+    c.execute("SELECT fail_count, last_fail_ts FROM attempts WHERE user=? AND action=?",
+              (user, action))
+    row = c.fetchone()
+    return (row[0], row[1]) if row else (0, 0)
+
+def set_attempt(conn, user, action, fail, ts):
+    c = conn.cursor()
+    c.execute("""
+      INSERT INTO attempts(user, action, fail_count, last_fail_ts)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user, action) DO UPDATE SET
+        fail_count=excluded.fail_count,
+        last_fail_ts=excluded.last_fail_ts
+    """, (user, action, fail, ts))
+    conn.commit()
+
+def check_bruteforce(conn, user, action):
+    fail, last = get_attempt(conn, user, action)
+    now = int(time.time())
+    if fail >= MAX_FAILS and now - last < BLOCK_SECONDS:
+        wait = BLOCK_SECONDS - (now - last)
+        print(f"Слишком много неверных кодов. Попробуйте через {wait} секунд.")
+        audit("blocked", user, action, target=sys.argv[1], argv=sys.argv[1:], result="BLOCKED")
+        sys.exit(1)
+
+def verify_totp_for_operator(operator):
+    ga_file = Path(f"/home/{operator}/.google_authenticator")
+    if not ga_file.exists():
+        print("Нет файла .google_authenticator у оператора.")
+        sys.exit(1)
+    secret = ga_file.read_text().splitlines()[0].strip()
+    totp = pyotp.TOTP(secret)
+    code = getpass.getpass("Введите TOTP-код оператора: ").strip()
+    return totp.verify(code, valid_window=1)
+
+def main():
+    if len(sys.argv) != 2:
+        print(f"Использование: {Path(sys.argv[0]).name} <user>")
+        sys.exit(1)
+
+    try:
+        target = sys.argv[1]
+        operator = os.environ.get("SUDO_USER")
+        action = "secure-passwd"
+        if not operator:
+            print("Необходим запуск через sudo")
+            sys.exit(1)
+        audit("start", operator, action, target=target, argv=sys.argv[1:], result="BEGIN")
+        conn = init_db()
+        check_bruteforce(conn, operator, action)
+
+        if not verify_totp_for_operator(operator):
+            print("Неверный TOTP-код.")
+            audit("totp", operator, action, target=target, argv=sys.argv[1:], result="DENY_TOTP")
+            fail, _ = get_attempt(conn, operator, action)
+            set_attempt(conn, operator, action, fail + 1, int(time.time()))
+            time.sleep(2)
+            sys.exit(1)
+
+        set_attempt(conn, operator, action, 0, int(time.time()))
+        audit("totp", operator, action, target=target, argv=sys.argv[1:], result="OK")
+        audit("exec", operator, action, target=target, argv=sys.argv[1:], result="RUN")
+        try:
+            subprocess.run(["/usr/bin/passwd", target], check=True)
+        except subprocess.CalledProcessError as e:
+            audit("done", operator, action, target=target, argv=sys.argv[1:], result=f"FAIL(rc={e.returncode})")
+            print("Операция не выполнена. Произошла ошибка (подробности в логах).")
+            sys.exit(1)
+        audit("done", operator, action, target=target, argv=sys.argv[1:], result="OK")
+    except KeyboardInterrupt:
+        print('\n')
+        sys.exit(130)
+
+if __name__ == "__main__":
+    main()

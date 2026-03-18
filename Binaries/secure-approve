@@ -1,0 +1,224 @@
+#!/usr/bin/python3
+import os, sys, time, json, sqlite3, getpass, hashlib, subprocess
+from pathlib import Path
+from datetime import datetime, timezone
+
+import pyotp
+
+DB_PATH = Path("/var/lib/risktotp/secure_totp.db")
+AUDIT_LOG = Path("/var/log/risktotp/audit.log")
+
+# allowed binaries
+ALLOWED_EXEC = {
+    "secure-admin": "/usr/local/sbin/secure-admin",
+    "secure-passwd": "/usr/local/sbin/secure-passwd",
+    "secure-sshkeys": "/usr/local/sbin/secure-sshkeys",
+}
+
+def require_sudo_user():
+    op = os.environ.get("SUDO_USER")
+    if not op:
+        print("Запуск только через sudo (нужен SUDO_USER).")
+        sys.exit(1)
+    return op
+
+def get_attempt(conn, user, action):
+    c = conn.cursor()
+    c.execute("SELECT fail_count, last_fail_ts FROM attempts WHERE user=? AND action=?",
+              (user, action))
+    row = c.fetchone()
+    return (row[0], row[1]) if row else (0, 0)
+
+def set_attempt(conn, user, action, fail, ts):
+    c = conn.cursor()
+    c.execute("""
+      INSERT INTO attempts(user, action, fail_count, last_fail_ts)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user, action) DO UPDATE SET
+        fail_count=excluded.fail_count,
+        last_fail_ts=excluded.last_fail_ts
+    """, (user, action, fail, ts))
+    conn.commit()
+
+def init_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS approvals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        requester TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target TEXT NOT NULL,
+        argv_json TEXT NOT NULL,
+        risk TEXT NOT NULL,
+        status TEXT NOT NULL,
+        approver TEXT,
+        approved_ts INTEGER,
+        exec_ts INTEGER,
+        exec_result TEXT
+    )""")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS attempts (
+            user TEXT NOT NULL,
+            action TEXT NOT NULL,
+            fail_count INTEGER NOT NULL,
+            last_fail_ts INTEGER NOT NULL,
+            PRIMARY KEY(user, action)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)")
+    conn.commit()
+    return conn
+
+def get_last_hash():
+    if not AUDIT_LOG.exists(): # which is strange
+        return "0" * 64
+    try:
+        # read last line
+        with AUDIT_LOG.open("rb") as f:
+            f.seek(0, 2) # from the end
+            size = f.tell()
+            if size == 0:
+                return "0" * 64
+            # read back
+            back = min(8192, size)
+            f.seek(-back, 2)
+            tail = f.read().splitlines()
+            for line in reversed(tail):
+                if line.strip():
+                    obj = json.loads(line.decode("utf-8", "ignore"))
+                    return obj.get("hash", "0"*64) # return last line hash
+    except Exception:
+        return "0" * 64 # any other way
+    return "0" * 64
+
+def audit(event, operator, action, target="", argv=None, result="", extra=None):
+    AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "operator": operator,
+        "uid": os.getuid(),
+        "action": action,
+        "target": target,
+        "argv": argv or [],
+        "result": result,
+        "extra": extra or {},
+    }
+    prev = get_last_hash()
+    rec["prev_hash"] = prev
+    payload = json.dumps(rec, ensure_ascii=False, sort_keys=True, separators=(",", ":")) # dump last entry
+    rec["hash"] = hashlib.sha256((prev + payload).encode("utf-8")).hexdigest() # get hash
+    line = json.dumps(rec, ensure_ascii=False)
+    with AUDIT_LOG.open("a", encoding="utf-8") as f:
+        f.write(line + "\n") # hopefully write
+
+def verify_totp_for_operator(operator):
+    ga_file = Path(f"/home/{operator}/.google_authenticator")
+    if not ga_file.exists():
+        print("Нет файла .google_authenticator у оператора.")
+        sys.exit(1)
+    secret = ga_file.read_text(errors="ignore").splitlines()[0].strip()
+    totp = pyotp.TOTP(secret)
+    code = getpass.getpass("Введите TOTP-код подтверждающего оператора: ").strip()
+    return totp.verify(code, valid_window=1)
+
+def load_approval(conn, app_id):
+    c = conn.cursor()
+    c.execute("""SELECT id, ts, requester, action, target, argv_json, risk, status, approver, approved_ts
+                 FROM approvals WHERE id=?""", (app_id,))
+    row = c.fetchone()
+    return row
+
+def mark_approved(conn, app_id, approver):
+    now = int(time.time())
+    c = conn.cursor()
+    c.execute("""UPDATE approvals SET status='APPROVED', approver=?, approved_ts=?
+                 WHERE id=? AND status='PENDING'""", (approver, now, app_id))
+    conn.commit()
+    return c.rowcount == 1
+
+def mark_exec(conn, app_id, status, result):
+    now = int(time.time())
+    c = conn.cursor()
+    c.execute("""UPDATE approvals SET status=?, exec_ts=?, exec_result=?
+                 WHERE id=?""", (status, now, result, app_id))
+    conn.commit()
+
+def main():
+    operator = require_sudo_user()
+    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
+        print(f"Использование: {Path(sys.argv[0]).name} <approval_id>")
+        sys.exit(1)
+
+    app_id = int(sys.argv[1])
+    conn = init_db()
+
+    row = load_approval(conn, app_id)
+    if not row:
+        print("Заявка не найдена.")
+        sys.exit(2)
+
+    (_id, _ts, requester, action, target, argv_json, risk, status, approver, approved_ts) = row
+
+    if status != "PENDING":
+        print(f"Заявка уже не в статусе PENDING (status={status}).")
+        sys.exit(3)
+
+    if requester == operator:
+        print("Нельзя подтверждать свою же заявку (нужен второй оператор).")
+        audit("approve", operator, "secure-approve", target=str(app_id), argv=sys.argv[1:], result="DENY_SELF",
+              extra={"requester": requester, "action": action, "risk": risk, "id":_id})
+        sys.exit(4)
+
+    audit("approve_start", operator, "secure-approve", target=str(app_id), argv=sys.argv[1:], result="BEGIN",
+          extra={"requester": requester, "action": action, "risk": risk, "target_user": target, "id":_id})
+
+    if not verify_totp_for_operator(operator):
+        print("Неверный TOTP-код.")
+        fail, _ = get_attempt(conn, operator, action)
+        set_attempt(conn, operator, "secure-approve", fail+1, int(time.time()))
+        audit("approve", operator, "secure-approve", target=str(app_id), argv=sys.argv[1:], result="DENY_TOTP", extra={"id":_id})
+        sys.exit(5)
+
+    if not mark_approved(conn, app_id, operator):
+        print("Не удалось подтвердить (возможно, статус изменился).")
+        audit("approve", operator, "secure-approve", target=str(app_id), argv=sys.argv[1:], result="RACE_FAIL", extra={"id":_id})
+        sys.exit(6)
+
+    audit("approved", operator, "secure-approve", target=str(app_id), argv=sys.argv[1:], result="OK",
+          extra={"requester": requester, "action": action, "risk": risk, "id":_id})
+
+    # check action and execute
+    if action not in ALLOWED_EXEC:
+        mark_exec(conn, app_id, "FAILED", f"unknown action {action}")
+        audit("exec", operator, "secure-approve", target=str(app_id), result="UNKNOWN_ACTION",
+              extra={"action": action, "id":_id})
+        print("Неизвестное действие заявки.")
+        sys.exit(7)
+
+    cmd = [ALLOWED_EXEC[action], "--execute-approved", str(app_id)] # i don't know, *should* probably try this?
+    try:
+        p = subprocess.run(cmd, check=False)
+        if p.returncode == 0:
+            mark_exec(conn, app_id, "EXECUTED", "OK")
+            audit("exec", operator, "secure-approve", target=str(app_id), result="EXEC_OK",
+                  extra={"cmd": cmd, "id":_id})
+            print(f"Заявка #{app_id} выполнена.")
+            sys.exit(0)
+        else:
+            mark_exec(conn, app_id, "FAILED", f"rc={p.returncode}")
+            audit("exec", operator, "secure-approve", target=str(app_id), result="EXEC_FAIL",
+                  extra={"cmd": cmd, "rc": p.returncode, "id":_id})
+            print(f"Ошибка выполнения заявки (rc={p.returncode}).")
+            sys.exit(p.returncode)
+    except Exception as e:
+        mark_exec(conn, app_id, "FAILED", f"exc:{e}")
+        audit("exec", operator, "secure-approve", target=str(app_id), result="EXEC_EXCEPTION",
+              extra={"cmd": cmd, "err": str(e), "id":_id})
+        print("Исключение при выполнении.")
+        sys.exit(10)
+
+if __name__ == "__main__":
+    main()
