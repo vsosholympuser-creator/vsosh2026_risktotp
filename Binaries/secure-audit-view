@@ -76,6 +76,7 @@ def verify_chain(lines):
 
         if h == "" or ph == "":
             print(f"FAIL: hash deletion detected at line {idx} (prev_hash or hash is empty)")
+            return 2
         if not h or not ph:
             skipped += 1
             continue
