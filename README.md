@@ -1,4 +1,4 @@
-# RiskTOTP — MFA (TOTP) для SSH и критичных админ-операций в Linux
+# RiskTOTP — MFA для SSH и критичных админ-операций в Linux
 
 **Направление:** Blue Team  
 **Форма продукта:** программный комплекс (PAM + утилиты-обёртки + AppArmor + аудит)
@@ -12,7 +12,7 @@ RiskTOTP добавляет **второй фактор (TOTP)** не тольк
 - смена паролей пользователей (`secure-passwd`)
 - управление SSH-ключами пользователей (`secure-sshkeys`)
 - ограниченный набор операций `useradd/usermod` (`secure-admin`)
-- (опционально) подтверждение CRITICAL-операций вторым оператором (`secure-approve`)
+- подтверждение наиболее опасных операций вторым оператором (`secure-approve`)
 
 ## Модель угроз (ограничения)
 Предполагается, что злоумышленник может получить валидные учётные данные оператора (пароль/SSH-ключ), но:
@@ -54,7 +54,7 @@ RiskTOTP добавляет **второй фактор (TOTP)** не тольк
 * копирует бинарники/скрипты в `/usr/local/sbin/`
 * настраивает группу `operators`
 * устанавливает sudoers в `/etc/sudoers.d/operators`
-* устанавливает/включает AppArmor и применяет профили
+* устанавливает и включает AppArmor и применяет профили
 * создаёт каталоги `/var/lib/risktotp` и `/var/log/risktotp`
 
 > Важно: перед использованием добавьте операторов в группу `operators`.
@@ -120,18 +120,18 @@ RiskTOTP добавляет **второй фактор (TOTP)** не тольк
 
 Примеры:
 
-`sudo secure-admin useradd <new_user>`
-`sudo secure-admin usermod lock <user>`
-`sudo secure-admin usermod add-groups <user> operators`
+1. `sudo secure-admin useradd <new_user>`
+2. `sudo secure-admin usermod lock <user>`
+3. `sudo secure-admin usermod add-groups <user> operators`
 
 ## Просмотр аудита
 
 Примеры:
 
-`sudo secure-audit-view --tail 50`
-`sudo secure-audit-view --approvals`
-`sudo secure-audit-view --id 4`
-`sudo secure-audit-view --verify`
+1. `sudo secure-audit-view --tail 50`
+2. `sudo secure-audit-view --approvals`
+3. `sudo secure-audit-view --id 4`
+4. `sudo secure-audit-view --verify`
 
 ---
 
@@ -142,22 +142,3 @@ RiskTOTP добавляет **второй фактор (TOTP)** не тольк
 * При достижении лимита попыток ввод блокируется на заданное время
 * При ошибке добавляется задержка (анти-брут)
 
----
-
-# Демонстрация (рекомендуемый сценарий)
-
-1. SSH вход: запрос пароля и TOTP.
-2. secure-passwd: смена пароля пользователю (TOTP + лог).
-3. secure-sshkeys add-file: добавление ключа (TOTP + лог).
-4. secure-admin usermod add-groups: управление группами (TOTP + лог).
-5. (опционально) CRITICAL approve: заявка → подтверждение → выполнение → цепочка логов.
-
----
-
-# Ограничения
-
-* Root может отключить защиту — root не рассматривается как ограничиваемая роль.
-* Не рассматриваются кейлоггеры/фишинг/кража TOTP-секретов.
-* Не учитываются уязвимости (CVE) и эскалация привилегий.
-
----
