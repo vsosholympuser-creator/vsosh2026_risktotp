@@ -105,18 +105,18 @@ def check_ssh_dir(user):
     # create ~/.ssh
     if not ssh_dir.exists():
         ssh_dir.mkdir(mode=0o700, parents=True)
-        os.chown(ssh_dir, 0, 0)
+        os.chown(ssh_dir, uid, gid)
     else:
         os.chmod(ssh_dir, 0o700)
-        os.chown(ssh_dir, 0, 0)
+        os.chown(ssh_dir, uid, gid)
 
     # create auth_keys dir
     if not auth_keys.exists():
         auth_keys.touch(mode=0o600)
-        os.chown(auth_keys, 0, 0)
+        os.chown(auth_keys, uid, gid)
     else:
         os.chmod(auth_keys, 0o600)
-        os.chown(auth_keys, 0, 0)
+        os.chown(auth_keys, uid, gid)
 
     #pass uid and gid for file chown
     return ssh_dir, auth_keys, uid, gid
