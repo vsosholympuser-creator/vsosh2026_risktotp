@@ -73,12 +73,16 @@ def verify_chain(lines):
 
         h = obj.get("hash")
         ph = obj.get("prev_hash")
+
+        if h == "" or ph == "":
+            print(f"FAIL: hash deletion detected at line {idx} (prev_hash or hash is empty)")
         if not h or not ph:
             skipped += 1
             continue
 
         if ph and not started:
             print(f"FAIL: first line has prev_hash set (hash trimming detected)")
+            return 2
 
         if not started:
             prev = ph
